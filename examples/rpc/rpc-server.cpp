@@ -1,4 +1,5 @@
 #include "ggml-cpu.h"
+#include "ggml.h"
 
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
@@ -29,6 +30,8 @@ struct rpc_server_params {
     std::string host        = "127.0.0.1";
     int         port        = 50052;
     size_t      backend_mem = 0;
+    int         threads     = GGML_DEFAULT_N_THREADS;
+    std::string backend     = "AUTO";
 };
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
@@ -38,6 +41,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H HOST, --host HOST  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p PORT, --port PORT  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -m MEM, --mem MEM     backend memory size (in MB)\n");
+    fprintf(stderr, "  -t N, --threads N     explicitly passing number of threads forces CPU backend (default: %d)", GGML_DEFAULT_N_THREADS);
     fprintf(stderr, "\n");
 }
 
@@ -63,6 +67,15 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
                 return false;
             }
             params.backend_mem = std::stoul(argv[i]) * 1024 * 1024;
+        } else if (arg == "-t" || arg == "--threads") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.threads = std::stoi(argv[i]);
+            params.backend = "CPU";
+            if (params.threads <= 0) {
+                return false;
+            }
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -75,38 +88,42 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
     return true;
 }
 
-static ggml_backend_t create_backend() {
+static ggml_backend_t create_backend(rpc_server_params & params) {
     ggml_backend_t backend = NULL;
+    if (params.backend == "AUTO") {
 #ifdef GGML_USE_CUDA
-    fprintf(stderr, "%s: using CUDA backend\n", __func__);
-    backend = ggml_backend_cuda_init(0); // init device 0
-    if (!backend) {
-        fprintf(stderr, "%s: ggml_backend_cuda_init() failed\n", __func__);
-    }
+        fprintf(stderr, "%s: using CUDA backend\n", __func__);
+        backend = ggml_backend_cuda_init(0); // init device 0
+        if (!backend) {
+            fprintf(stderr, "%s: ggml_backend_cuda_init() failed\n", __func__);
+        }
 #elif GGML_USE_METAL
-    fprintf(stderr, "%s: using Metal backend\n", __func__);
-    backend = ggml_backend_metal_init();
-    if (!backend) {
-        fprintf(stderr, "%s: ggml_backend_metal_init() failed\n", __func__);
-    }
+        fprintf(stderr, "%s: using Metal backend\n", __func__);
+        backend = ggml_backend_metal_init();
+        if (!backend) {
+            fprintf(stderr, "%s: ggml_backend_metal_init() failed\n", __func__);
+        }
 #elif GGML_USE_VULKAN
-    fprintf(stderr, "%s: using Vulkan backend\n", __func__);
-    backend = ggml_backend_vk_init(0); // init device 0
-    if (!backend) {
-        fprintf(stderr, "%s: ggml_backend_vulkan_init() failed\n", __func__);
-    }
+        fprintf(stderr, "%s: using Vulkan backend\n", __func__);
+        backend = ggml_backend_vk_init(0); // init device 0
+        if (!backend) {
+            fprintf(stderr, "%s: ggml_backend_vulkan_init() failed\n", __func__);
+        }
 #elif GGML_USE_SYCL
-    fprintf(stderr, "%s: using SYCL backend\n", __func__);
-    backend = ggml_backend_sycl_init(0); // init device 0
-    if (!backend) {
-        fprintf(stderr, "%s: ggml_backend_sycl_init() failed\n", __func__);
-    }
+        fprintf(stderr, "%s: using SYCL backend\n", __func__);
+        backend = ggml_backend_sycl_init(0); // init device 0
+        if (!backend) {
+            fprintf(stderr, "%s: ggml_backend_sycl_init() failed\n", __func__);
+        }
 #endif
+    }
 
     // if there aren't GPU Backends fallback to CPU backend
     if (!backend) {
         fprintf(stderr, "%s: using CPU backend\n", __func__);
         backend = ggml_backend_cpu_init();
+        // explicitly set number of threads
+        ggml_backend_cpu_set_n_threads(backend, params.threads);
     }
     return backend;
 }
@@ -151,7 +168,7 @@ int main(int argc, char * argv[]) {
         fprintf(stderr, "\n");
     }
 
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_backend(params);
     if (!backend) {
         fprintf(stderr, "Failed to create backend\n");
         return 1;
@@ -164,7 +181,7 @@ int main(int argc, char * argv[]) {
     } else {
         get_backend_memory(&free_mem, &total_mem);
     }
-    printf("Starting RPC server on %s, backend memory: %zu MB\n", endpoint.c_str(), free_mem / (1024 * 1024));
+    printf("Starting RPC server on %s, backend memory: %zu MB, threads: %d\n", endpoint.c_str(), free_mem / (1024 * 1024), params.threads);
     ggml_backend_rpc_start_server(backend, endpoint.c_str(), free_mem, total_mem);
     ggml_backend_free(backend);
     return 0;
