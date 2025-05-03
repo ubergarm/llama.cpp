@@ -1,9 +1,10 @@
+#include "common.h"
 #include "arg.h"
-#include "log.h"
 #include "ggml.h"
 #include "llama.h"
 #include "common.h"
-#include "../src/llama-vocab.h"
+//#include "llama-vocab.h"
+#include "log.h"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -20,49 +21,96 @@
 #include <vector>
 
 static void print_usage(int, char ** argv) {
-    LOG_INF("\nexample usage:\n");
-    LOG_INF("\n    %s -m model.gguf -c 8192 -b 2048 -ub 512\n", argv[0]);
-    LOG_INF("\n");
+    LOG("\nexample usage:\n");
+    LOG("\n    %s -m model.gguf -c 8192 -b 2048 -ub 512\n", argv[0]);
+    LOG("\n");
 }
 
 int main(int argc, char ** argv) {
-    common_params params;
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+    std::vector<char*> args;
+    args.reserve(argc);
+    args.push_back(argv[0]);
+
+    bool sweep_bench_output_jsonl = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg{argv[1]};
+        if (arg == "--output-format") {
+            bool invalid_arg = false;
+            if (i < argc-1) {
+                arg = argv[++i];
+                if (arg == "jsonl") sweep_bench_output_jsonl = true;
+                else if (arg == "md") sweep_bench_output_jsonl = false;
+                else invalid_arg = true;
+            } else {
+                invalid_arg = true;
+            }
+            if (invalid_arg) {
+                LOG("Invalid arg"); return 1;
+            }
+        } else {
+            args.push_back(argv[i]);
+        }
+    }
+
+    common_params params;
+    if (!common_params_parse(args.size(), args.data(), params, LLAMA_EXAMPLE_BENCH, print_usage)) {
         return 1;
     }
 
     common_init();
 
+    //gpt_params params;
+
+    //if (!gpt_params_parse(argc, argv, params)) {
+    //    print_usage(argc, argv);
+    //    return 1;
+    //}
+
     // init LLM
+
     llama_backend_init();
     llama_numa_init(params.numa);
 
     // initialize the model
-    common_init_result llama_init = common_init_from_params(params);
 
-    llama_model * model = llama_init.model.get();
-    llama_context * ctx = llama_init.context.get();
+    //llama_model_params model_params = llama_model_params_from_gpt_params(params);
+    llama_model_params model_params = common_model_params_to_llama(params);
 
-    if (model == nullptr || ctx == nullptr) {
-        LOG_ERR("%s : failed to init\n", __func__);
+    //llama_model * model = llama_load_model_from_file(params.model.c_str(), model_params);
+    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), model_params);
+
+    if (model == NULL) {
+        fprintf(stderr , "%s: error: unable to load model\n" , __func__);
         return 1;
     }
 
-    // print system information
-    {
-        LOG_INF("\n");
-        LOG_INF("%s\n", common_params_get_system_info(params).c_str());
-        LOG_INF("\n");
+    //llama_context_params ctx_params = llama_context_params_from_gpt_params(params);
+    llama_context_params ctx_params = common_context_params_to_llama(params);
+
+    //llama_context * ctx = llama_new_context_with_model(model, ctx_params);
+    llama_context * ctx = llama_init_from_model(model, ctx_params);
+
+    if (ctx == NULL) {
+        fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
+        return 1;
     }
 
     const unsigned int n_kv_max = llama_n_ctx(ctx);
 
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-    llama_token bos = vocab->token_bos();
-    const unsigned int n_vocab  = llama_vocab_n_tokens(vocab);
 
-    // decode in batches of n_batch tokens
+    auto vocab   = llama_model_get_vocab(model);
+    auto n_vocab = llama_vocab_n_tokens(vocab);
+    auto bos     = llama_vocab_bos(vocab);
+
+    //const llama_vocab * vocab = llama_get_vocab(ctx);
+    //llama_token bos = llama_token_bos_impl(*vocab);
+    //llama_token eos = llama_token_eos_impl(*vocab);
+
+    //const unsigned int n_vocab  = llama_n_vocab(model);
+
+    // decode in batches of ctx_params.n_batch tokens
     auto decode_helper = [](llama_context * ctx, llama_batch & batch, int32_t n_batch) {
         for (int32_t i = 0; i < (int32_t) batch.n_tokens; i += n_batch) {
             const int32_t n_tokens = std::min(n_batch, (int32_t) (batch.n_tokens - i));
@@ -92,34 +140,34 @@ int main(int argc, char ** argv) {
     const unsigned int pp = params.n_ubatch;
     const unsigned int tg = params.n_ubatch / 4;
 
-    const unsigned int n_threads       = params.cpuparams.n_threads;
-    const unsigned int n_threads_batch = params.cpuparams_batch.n_threads;
-    const int32_t n_batch = llama_n_batch(ctx);
-
-    LOG_INF("\n");
-    LOG_INF("%s: n_kv_max = %d, n_batch = %d, n_ubatch = %d, flash_attn = %d, n_gpu_layers = %d, n_threads = %u, n_threads_batch = %u\n", __func__, n_kv_max, params.n_batch, params.n_ubatch, params.flash_attn, params.n_gpu_layers, n_threads, n_threads_batch);
-    LOG_INF("\n");
-    LOG_INF("|%6s | %6s | %6s | %8s | %8s | %8s | %8s |\n", "PP", "TG", "N_KV", "T_PP s", "S_PP t/s", "T_TG s", "S_TG t/s");
-    LOG_INF("|%6s-|-%6s-|-%6s-|-%8s-|-%8s-|-%8s-|-%8s-|\n", "------", "------", "------", "--------", "--------", "--------", "--------");
+    if (!sweep_bench_output_jsonl) {
+        LOG_INF("\n");
+        LOG_INF("%s: n_kv_max = %d, n_batch = %d, n_ubatch = %d, flash_attn = %d, n_gpu_layers = %d, n_threads = %u, n_threads_batch = %u\n", __func__, n_kv_max, params.n_batch, params.n_ubatch, params.flash_attn, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch);
+        LOG_INF("\n");
+        LOG_INF("|%6s | %6s | %6s | %8s | %8s | %8s | %8s |\n", "PP", "TG", "N_KV", "T_PP s", "S_PP t/s", "T_TG s", "S_TG t/s");
+        LOG_INF("|%6s-|-%6s-|-%6s-|-%8s-|-%8s-|-%8s-|-%8s-|\n", "------", "------", "------", "--------", "--------", "--------", "--------");
+    }
 
     llama_batch batch = llama_batch_init(n_kv_max, 0, 1);
 
     // warm up
     {
         common_batch_add(batch, bos, 0, { 0 }, false);
+        //llama_batch_add(batch, bos, 0, { 0 }, false);
 
-        if (!decode_helper(ctx, batch, n_batch)) {
+        if (!decode_helper(ctx, batch, ctx_params.n_batch)) {
             LOG_INF("%s: llama_decode() failed\n", __func__);
             return 1;
         }
     }
 
     common_batch_clear(batch);
+    //llama_batch_clear(batch);
     llama_kv_self_clear(ctx);
 
     for (unsigned int n_kv = 0; n_kv < n_kv_max; n_kv += params.n_ubatch) {
         // clean up KV cache before generation
-        llama_kv_self_seq_rm(ctx, 0,n_kv, -1);
+        llama_kv_self_seq_rm(ctx, 0, n_kv, -1);
 
         // first measure token generation performance at this context size
         const auto t_tg_start = ggml_time_us();
@@ -127,8 +175,10 @@ int main(int argc, char ** argv) {
         for (unsigned int i = 0; i < tg; ++i) {
             common_batch_clear(batch);
             common_batch_add(batch, std::rand() % n_vocab, n_kv + i, { 0 }, true);
+            //llama_batch_clear(batch);
+            //llama_batch_add(batch, std::rand() % n_vocab, n_kv + i, { 0 }, true);
 
-            if (!decode_helper(ctx, batch, n_batch)) {
+            if (!decode_helper(ctx, batch, ctx_params.n_batch)) {
                 LOG_INF("%s: llama_decode() failed\n", __func__);
                 return 1;
             }
@@ -141,16 +191,18 @@ int main(int argc, char ** argv) {
 
         // prepare batch of pp size for prompt processing performance measurement
         common_batch_clear(batch);
+        //llama_batch_clear(batch);
 
         for (unsigned int i = 0; i < pp; ++i) {
             common_batch_add(batch, std::rand() % n_vocab, n_kv + i, { 0 }, false);
+            //llama_batch_add(batch, std::rand() % n_vocab, n_kv + i, { 0 }, false);
         }
         batch.logits[batch.n_tokens - 1] = true;
 
         // measure prompt processing performance
         const auto t_pp_start = ggml_time_us();
 
-        if (!decode_helper(ctx, batch, n_batch)) {
+        if (!decode_helper(ctx, batch, ctx_params.n_batch)) {
             LOG_INF("%s: llama_decode() failed\n", __func__);
             return 1;
         }
@@ -164,8 +216,22 @@ int main(int argc, char ** argv) {
         const float speed_pp = pp / t_pp;
         const float speed_tg = tg / t_tg;
 
-        LOG_INF("|%6d | %6d | %6d | %8.3f | %8.2f | %8.3f | %8.2f |\n", pp, tg, n_kv, t_pp, speed_pp, t_tg, speed_tg);
+        if(sweep_bench_output_jsonl) {
+            LOG_INF(
+                "{\"n_kv_max\": %d, \"n_batch\": %d, \"n_ubatch\": %d, \"flash_attn\": %d, \"n_gpu_layers\": %d, \"n_threads\": %u, \"n_threads_batch\": %u, "
+                "\"pp\": %d, \"tg\": %d, \"n_kv\": %d, \"t_pp\": %f, \"speed_pp\": %f, \"t_tg\": %f, \"speed_tg\": %f }\n",
+                n_kv_max, params.n_batch, params.n_ubatch, params.flash_attn, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch,
+                pp, tg, n_kv, t_pp, speed_pp, t_tg, speed_tg
+            );
+        } else {
+            LOG_INF("|%6d | %6d | %6d | %8.3f | %8.2f | %8.3f | %8.2f |\n", pp, tg, n_kv, t_pp, speed_pp, t_tg, speed_tg);
+        }
     }
+
+    llama_batch_free(batch);
+
+    llama_free(ctx);
+    llama_model_free(model);
 
     llama_backend_free();
 
