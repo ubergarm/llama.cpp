@@ -161,6 +161,25 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // Adapted into mainline from original PR: https://github.com/ikawrakow/ik_llama.cpp/pull/375
+    //if (params.batch_warmup) {
+    if (true) {
+        // clean up KV cache after generation
+        llama_kv_self_clear(ctx);
+
+        // prepare batch of pp size for prompt processing performance measurement
+        common_batch_clear(batch);
+
+        for (unsigned int i = 0; i < (unsigned int)params.n_ubatch; ++i) {
+            common_batch_add(batch, std::rand() % n_vocab, i, { 0 }, false);
+        }
+
+        if (!decode_helper(ctx, batch, ctx_params.n_ubatch)) {
+            LOG_INF("%s: llama_decode() failed\n", __func__);
+            return 1;
+        }
+    }
+
     common_batch_clear(batch);
     //llama_batch_clear(batch);
     llama_kv_self_clear(ctx);
