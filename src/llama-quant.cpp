@@ -10,7 +10,6 @@
 #include <cinttypes>
 #include <fstream>
 #include <mutex>
-#include <regex>
 #include <thread>
 #include <unordered_map>
 
@@ -48,14 +47,8 @@ struct quantize_state_impl {
         {}
 };
 
-// changes to this struct must be replicated in quantize.cpp
-struct tensor_quantization {
-    std::string name;
-    ggml_type quant = GGML_TYPE_COUNT;
-};
-
 static void llama_tensor_dequantize_impl(
-    ggml_tensor * tensor, std::vector<no_init<float>> & output, std::vector<std::thread> & workers,
+    struct ggml_tensor * tensor, std::vector<no_init<float>> & output, std::vector<std::thread> & workers,
     const size_t nelements, const int nthread
 ) {
     if (output.size() < nelements) {
@@ -194,6 +187,7 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
         }
     } else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S ||
                ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M    || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
+        bool is_one_bit = (ftype == LLAMA_FTYPE_MOSTLY_IQ1_M || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S);
         if (name.find("attn_v.weight") != std::string::npos) {
             if (qs.model.hparams.n_gqa() >= 4 || qs.model.hparams.n_expert >= 4) new_type = GGML_TYPE_Q4_K;
             else new_type = ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M ? GGML_TYPE_IQ3_S : GGML_TYPE_Q2_K;
@@ -202,19 +196,76 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
         else if (qs.model.hparams.n_expert == 8 && name.find("attn_k.weight") != std::string::npos) {
             new_type = GGML_TYPE_Q4_K;
         }
+        else if (name.find("ffn_down.weight") != std::string::npos) {
+            // First 3 Layers
+            new_type = GGML_TYPE_Q6_K;
+            ++qs.i_ffn_down;
+        }
+        else if (name.find("ffn_down_shexp.weight") != std::string::npos) {
+            // Shared experts
+            new_type = GGML_TYPE_Q6_K;
+            ++qs.i_ffn_down;
+        }
         else if (name.find("ffn_down") != std::string::npos) {
-            if (qs.i_ffn_down < qs.n_ffn_down/8) {
-                new_type = ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M ? GGML_TYPE_IQ3_S : GGML_TYPE_Q2_K;
+            auto info = layer_info(qs.i_ffn_down, qs.n_ffn_down, name.c_str());
+            int i_layer = info.first, n_layer = info.second;
+            // Layers 0, 1, 2 are Dense so Q4_K
+            // 3, 4, 5 left as Q2_K
+            if (is_one_bit) {
+                // 3, 4, 5, 6, 7, 8 left as 2.06 bpw
+                if (i_layer < 9) new_type = GGML_TYPE_IQ2_XXS; // 2.06 bpw
+            }
+            else {
+                if  (i_layer < 6) new_type = GGML_TYPE_Q3_K;
+                else new_type = GGML_TYPE_Q2_K;
             }
             ++qs.i_ffn_down;
         }
+        else if (name.find("ffn_gate.weight") != std::string::npos) {
+            // First 3 Layers
+            new_type = GGML_TYPE_Q4_K;
+            ++qs.i_ffn_gate;
+        }
+        else if (name.find("ffn_gate_shexp.weight") != std::string::npos) {
+            // Shared experts
+            new_type = GGML_TYPE_Q5_K;
+            ++qs.i_ffn_gate;
+        }
+        else if (name.find("ffn_up.weight") != std::string::npos) {
+            // First 3 Layers
+            new_type = GGML_TYPE_Q4_K;
+            ++qs.i_ffn_up;
+        }
+        else if (name.find("ffn_up_shexp.weight") != std::string::npos) {
+            // Shared experts
+            new_type = GGML_TYPE_Q5_K;
+            ++qs.i_ffn_up;
+        }
+        else if (name.find("attn_kv_a_mqa.weight") != std::string::npos) {
+            // MLA projection matrices for KV
+            new_type = GGML_TYPE_Q6_K;
+        }
+        else if (name.find("attn_kv_b.weight") != std::string::npos) {
+            // MLA projection matrices for KV
+            new_type = GGML_TYPE_Q6_K;
+        }
+        else if (name.find("attn_q_a.weight") != std::string::npos) {
+            // MLA projection matrices for Q
+            new_type = GGML_TYPE_Q4_K;
+        }
+        else if (name.find("attn_q_b.weight") != std::string::npos) {
+            // MLA projection matrices for Q
+            new_type = GGML_TYPE_Q4_K;
+        }
         else if (name.find("attn_output.weight") != std::string::npos) {
-            if (qs.model.hparams.n_expert == 8) {
-                new_type = GGML_TYPE_Q5_K;
-            } else {
-                if (ftype == LLAMA_FTYPE_MOSTLY_IQ1_S || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) new_type = GGML_TYPE_IQ2_XXS;
-                else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M) new_type = GGML_TYPE_IQ3_S;
-            }
+            // Leave as 4bit
+            new_type = GGML_TYPE_Q4_K;
+            // if (qs.model.hparams.n_expert == 8) {
+            //     new_type = GGML_TYPE_Q5_K;
+            // } else {
+            //     if (ftype == LLAMA_FTYPE_MOSTLY_IQ1_S || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) new_type = GGML_TYPE_IQ2_XXS;
+            //     else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M) new_type = GGML_TYPE_IQ3_S;
+            // }
         }
     } else if (name.find("attn_v.weight") != std::string::npos) {
         if      (ftype == LLAMA_FTYPE_MOSTLY_Q2_K) {
@@ -273,10 +324,23 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
         else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS) {
             new_type = GGML_TYPE_IQ2_S;
         }
+    } else if (name.find("ffn_down.weight") != std::string::npos) {
+        // First 3 Layers
+        new_type = GGML_TYPE_Q6_K;
+        ++qs.i_ffn_down;
+    } else if (name.find("ffn_down_shexp.weight") != std::string::npos) {
+        // Shared experts
+        new_type = GGML_TYPE_Q6_K;
+        ++qs.i_ffn_down;
     } else if (name.find("ffn_down") != std::string::npos) {
         auto info = layer_info(qs.i_ffn_down, qs.n_ffn_down, name.c_str());
         int i_layer = info.first, n_layer = info.second;
-        if      (ftype == LLAMA_FTYPE_MOSTLY_Q2_K) new_type = GGML_TYPE_Q3_K;
+        if      (ftype == LLAMA_FTYPE_MOSTLY_Q2_K) {
+            // Layers 0, 1, 2 are Dense so Q4_K
+            // 3, 4, 5 left as Q3_K
+            if   (i_layer < 6) new_type = GGML_TYPE_Q3_K;
+            else new_type = GGML_TYPE_Q2_K;
+        }
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q2_K_S) {
             if (i_layer < n_layer/8) new_type = GGML_TYPE_Q4_K;
         }
@@ -319,6 +383,9 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
         }
         ++qs.i_ffn_down;
     } else if (name.find("attn_output.weight") != std::string::npos) {
+        // Leave as 4bit
+        new_type = GGML_TYPE_Q4_K;
+    } else if (name.find("attn_output.weight") != std::string::npos) {
         if (arch != LLM_ARCH_FALCON) {
             if (qs.model.hparams.n_expert == 8) {
                 if (ftype == LLAMA_FTYPE_MOSTLY_Q2_K   || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS ||
@@ -344,14 +411,31 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
         }
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M) new_type = GGML_TYPE_Q5_K;
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q5_K_M) new_type = GGML_TYPE_Q6_K;
-    }
-    else if (name.find("ffn_gate") != std::string::npos) {
+    } else if (name.find("ffn_gate.weight") != std::string::npos) {
+        // First 3 Layers
+        new_type = GGML_TYPE_Q4_K;
+        ++qs.i_ffn_gate;
+    } else if (name.find("ffn_gate_shexp.weight") != std::string::npos) {
+        // Shared experts
+        new_type = GGML_TYPE_Q4_K;
+        ++qs.i_ffn_gate;
+    } else if (name.find("ffn_gate") != std::string::npos) {
         auto info = layer_info(qs.i_ffn_gate, qs.n_ffn_gate, name.c_str());
         int i_layer = info.first, n_layer = info.second;
         if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_XS && (i_layer >= n_layer/8 && i_layer < 7*n_layer/8)) {
             new_type = GGML_TYPE_IQ3_XXS;
         }
         ++qs.i_ffn_gate;
+    }
+    else if (name.find("ffn_up.weight") != std::string::npos) {
+        // First 3 Layers
+        new_type = GGML_TYPE_Q4_K;
+        ++qs.i_ffn_up;
+    }
+    else if (name.find("ffn_up_shexp.weight") != std::string::npos) {
+        // Shared experts
+        new_type = GGML_TYPE_Q4_K;
+        ++qs.i_ffn_up;
     }
     else if (name.find("ffn_up") != std::string::npos) {
         auto info = layer_info(qs.i_ffn_up, qs.n_ffn_up, name.c_str());
@@ -360,6 +444,22 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
             new_type = GGML_TYPE_IQ3_XXS;
         }
         ++qs.i_ffn_up;
+    }
+    else if (name.find("attn_kv_a_mqa.weight") != std::string::npos) {
+        // MLA projection matrices for KV
+        new_type = GGML_TYPE_Q6_K;
+    }
+    else if (name.find("attn_kv_b.weight") != std::string::npos) {
+        // MLA projection matrices for KV
+        new_type = GGML_TYPE_Q6_K;
+    }
+    else if (name.find("attn_q_a.weight") != std::string::npos) {
+        // MLA projection matrices for Q
+        new_type = GGML_TYPE_Q4_K;
+    }
+    else if (name.find("attn_q_b.weight") != std::string::npos) {
+        // MLA projection matrices for Q
+        new_type = GGML_TYPE_Q4_K;
     }
 
     //    if (ftype == LLAMA_FTYPE_MOSTLY_Q2_K) new_type = GGML_TYPE_Q3_K;
@@ -534,7 +634,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     }
 
     std::vector<std::string> splits = {};
-    llama_model_loader ml(fname_inp, splits, use_mmap, /*check_tensors*/ true, kv_overrides, nullptr);
+    llama_model_loader ml(fname_inp, splits, use_mmap, /*check_tensors*/ true, kv_overrides);
     ml.init_mappings(false); // no prefetching
 
     llama_model model(llama_model_default_params());
@@ -543,7 +643,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     model.load_hparams(ml);
     model.load_stats  (ml);
 
-    quantize_state_impl qs(model, params);
+    struct quantize_state_impl qs(model, params);
 
     if (params->only_copy) {
         ftype = ml.ftype;
@@ -668,7 +768,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // populate the original tensors so we get an initial meta data
     for (const auto * it : tensors) {
         uint16_t i_split = params->keep_split ? it->idx : 0;
-        ggml_tensor * tensor = it->tensor;
+        struct ggml_tensor * tensor = it->tensor;
         if (!ctx_outs[i_split]) {
             ctx_outs[i_split].reset(gguf_init_empty());
         }
@@ -717,7 +817,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     new_ofstream(0);
     for (const auto * it : tensors) {
         const auto & weight = *it;
-        ggml_tensor * tensor = weight.tensor;
+        struct ggml_tensor * tensor = weight.tensor;
         if (weight.idx != cur_split && params->keep_split) {
             close_ofstream();
             new_ofstream(weight.idx);
@@ -763,19 +863,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         // NOTE: can't use LLM_TN here because the layer number is not known
         quantize &= name.find("ssm_conv1d.weight") == std::string::npos;
 
-        // do not quantize RWKV's small yet 2D weights
+        // do not quantize RWKV's time_mix_first tensors
         quantize &= name.find("time_mix_first.weight") == std::string::npos;
-        quantize &= name.find("time_mix_w0.weight") == std::string::npos;
         quantize &= name.find("time_mix_w1.weight") == std::string::npos;
         quantize &= name.find("time_mix_w2.weight") == std::string::npos;
-        quantize &= name.find("time_mix_v0.weight") == std::string::npos;
-        quantize &= name.find("time_mix_v1.weight") == std::string::npos;
-        quantize &= name.find("time_mix_v2.weight") == std::string::npos;
-        quantize &= name.find("time_mix_a0.weight") == std::string::npos;
-        quantize &= name.find("time_mix_a1.weight") == std::string::npos;
-        quantize &= name.find("time_mix_a2.weight") == std::string::npos;
-        quantize &= name.find("time_mix_g1.weight") == std::string::npos;
-        quantize &= name.find("time_mix_g2.weight") == std::string::npos;
         quantize &= name.find("time_mix_decay_w1.weight") == std::string::npos;
         quantize &= name.find("time_mix_decay_w2.weight") == std::string::npos;
         quantize &= name.find("time_mix_lerp_fused.weight") == std::string::npos;
@@ -783,7 +874,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         // do not quantize relative position bias (T5)
         quantize &= name.find("attn_rel_b.weight") == std::string::npos;
 
-        ggml_type new_type;
+        enum ggml_type new_type;
         void * new_data;
         size_t new_size;
 
@@ -793,19 +884,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             // get more optimal quantization type based on the tensor shape, layer, etc.
             if (!params->pure && ggml_is_quantized(default_type)) {
                 new_type = llama_tensor_get_type(qs, new_type, tensor, ftype);
-                // unless the user specifies a type
-                if (params->tensor_types) {
-                    const std::vector<tensor_quantization> & tensor_types = *static_cast<const std::vector<tensor_quantization> *>(params->tensor_types);
-                    for (const auto & [tname, qtype] : tensor_types) {
-                        if (std::regex pattern(tname); std::regex_search(tensor->name, pattern)) {
-                            if (qtype != new_type) {
-                                LLAMA_LOG_DEBUG("(overriding %s -> %s), ", ggml_type_name(new_type), ggml_type_name(qtype));
-                            }
-                            new_type = qtype;
-                            break;
-                        }
-                    }
-                }
             }
             if (params->token_embedding_type < GGML_TYPE_COUNT && strcmp(tensor->name, "token_embd.weight") == 0) {
                 new_type = params->token_embedding_type;
@@ -930,8 +1008,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 // interface implementation
 //
 
-llama_model_quantize_params llama_model_quantize_default_params() {
-    llama_model_quantize_params result = {
+struct llama_model_quantize_params llama_model_quantize_default_params() {
+    struct llama_model_quantize_params result = {
         /*.nthread                     =*/ 0,
         /*.ftype                       =*/ LLAMA_FTYPE_MOSTLY_Q5_1,
         /*.output_tensor_type          =*/ GGML_TYPE_COUNT,
@@ -943,7 +1021,6 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.keep_split                  =*/ false,
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
-        /*.tensor_type                 =*/ nullptr,
     };
 
     return result;
