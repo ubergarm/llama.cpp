@@ -91,6 +91,7 @@ int main(int argc, char ** argv) {
 
     //llama_context * ctx = llama_new_context_with_model(model, ctx_params);
     llama_context * ctx = llama_init_from_model(model, ctx_params);
+    auto * mem = llama_get_memory(ctx);
 
     if (ctx == NULL) {
         fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
@@ -165,7 +166,9 @@ int main(int argc, char ** argv) {
     //if (params.batch_warmup) {
     if (true) {
         // clean up KV cache after generation
-        llama_kv_self_clear(ctx);
+        // llama_kv_self_clear(ctx);
+        llama_memory_clear(mem, true);
+
 
         // prepare batch of pp size for prompt processing performance measurement
         common_batch_clear(batch);
@@ -182,11 +185,13 @@ int main(int argc, char ** argv) {
 
     common_batch_clear(batch);
     //llama_batch_clear(batch);
-    llama_kv_self_clear(ctx);
+    //llama_kv_self_clear(ctx);
+    llama_memory_clear(mem, true);
 
     for (unsigned int n_kv = 0; n_kv < n_kv_max; n_kv += params.n_ubatch) {
         // clean up KV cache before generation
-        llama_kv_self_seq_rm(ctx, 0, n_kv, -1);
+        //llama_kv_self_seq_rm(ctx, 0, n_kv, -1);
+        llama_memory_seq_rm(mem, 0, n_kv, -1);
 
         // first measure token generation performance at this context size
         const auto t_tg_start = ggml_time_us();
@@ -206,7 +211,8 @@ int main(int argc, char ** argv) {
         const auto t_tg_end = ggml_time_us();
 
         // clean up KV cache after generation
-        llama_kv_self_seq_rm(ctx, 0, n_kv, -1);
+        //llama_kv_self_seq_rm(ctx, 0, n_kv, -1);
+        llama_memory_seq_rm(mem, 0, n_kv, -1);
 
         // prepare batch of pp size for prompt processing performance measurement
         common_batch_clear(batch);
