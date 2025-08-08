@@ -69,6 +69,10 @@
 #include "ggml-cann.h"
 #endif
 
+#ifdef GGML_USE_ET
+#include "ggml-et.h"
+#endif
+
 // disable C++17 deprecation warning for std::codecvt_utf8
 #if defined(__clang__)
 #    pragma clang diagnostic push
@@ -207,6 +211,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_RPC
         register_backend(ggml_backend_rpc_reg());
+#endif
+#ifdef GGML_USE_ET
+        register_backend(ggml_backend_et_reg());
 #endif
 #ifdef GGML_USE_CPU
         register_backend(ggml_backend_cpu_reg());
