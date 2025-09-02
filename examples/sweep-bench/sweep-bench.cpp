@@ -143,7 +143,7 @@ int main(int argc, char ** argv) {
 
     if (!sweep_bench_output_jsonl) {
         LOG_INF("\n");
-        LOG_INF("%s: n_kv_max = %d, n_batch = %d, n_ubatch = %d, flash_attn = %d, n_gpu_layers = %d, n_threads = %u, n_threads_batch = %u\n", __func__, n_kv_max, params.n_batch, params.n_ubatch, params.flash_attn, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch);
+        LOG_INF("%s: n_kv_max = %d, n_batch = %d, n_ubatch = %d, flash_attn_type = %d, n_gpu_layers = %d, n_threads = %u, n_threads_batch = %u\n", __func__, n_kv_max, params.n_batch, params.n_ubatch, params.flash_attn_type, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch);
         LOG_INF("\n");
         LOG_INF("|%6s | %6s | %6s | %8s | %8s | %8s | %8s |\n", "PP", "TG", "N_KV", "T_PP s", "S_PP t/s", "T_TG s", "S_TG t/s");
         LOG_INF("|%6s-|-%6s-|-%6s-|-%8s-|-%8s-|-%8s-|-%8s-|\n", "------", "------", "------", "--------", "--------", "--------", "--------");
@@ -243,9 +243,9 @@ int main(int argc, char ** argv) {
 
         if(sweep_bench_output_jsonl) {
             LOG_INF(
-                "{\"n_kv_max\": %d, \"n_batch\": %d, \"n_ubatch\": %d, \"flash_attn\": %d, \"n_gpu_layers\": %d, \"n_threads\": %u, \"n_threads_batch\": %u, "
+                "{\"n_kv_max\": %d, \"n_batch\": %d, \"n_ubatch\": %d, \"flash_attn_type\": %d, \"n_gpu_layers\": %d, \"n_threads\": %u, \"n_threads_batch\": %u, "
                 "\"pp\": %d, \"tg\": %d, \"n_kv\": %d, \"t_pp\": %f, \"speed_pp\": %f, \"t_tg\": %f, \"speed_tg\": %f }\n",
-                n_kv_max, params.n_batch, params.n_ubatch, params.flash_attn, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch,
+                n_kv_max, params.n_batch, params.n_ubatch, params.flash_attn_type, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch,
                 pp, tg, n_kv, t_pp, speed_pp, t_tg, speed_tg
             );
         } else {
