@@ -100,7 +100,7 @@ int main(int argc, char ** argv) {
     };
 
     const unsigned int pp = params.n_ubatch;
-    const unsigned int tg = params.n_ubatch / 4;
+    const unsigned int tg = params.n_predict > 0 ? params.n_predict : params.n_ubatch / 4;
 
     if (!sweep_bench_output_jsonl) {
         LOG_INF("\n");
