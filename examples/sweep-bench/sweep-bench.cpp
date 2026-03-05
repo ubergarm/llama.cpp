@@ -1,9 +1,7 @@
-#include "common.h"
 #include "arg.h"
 #include "ggml.h"
 #include "llama.h"
 #include "common.h"
-//#include "llama-vocab.h"
 #include "log.h"
 
 #ifdef _WIN32
@@ -27,7 +25,7 @@ static void print_usage(int, char ** argv) {
 }
 
 int main(int argc, char ** argv) {
-
+    // Parse output-format arg first (sweep-bench specific)
     std::vector<char*> args;
     args.reserve(argc);
     args.push_back(argv[0]);
@@ -35,81 +33,44 @@ int main(int argc, char ** argv) {
     bool sweep_bench_output_jsonl = false;
 
     for (int i = 1; i < argc; ++i) {
-        std::string arg{argv[1]};
+        std::string arg{argv[i]};
         if (arg == "--output-format") {
-            bool invalid_arg = false;
             if (i < argc-1) {
                 arg = argv[++i];
                 if (arg == "jsonl") sweep_bench_output_jsonl = true;
                 else if (arg == "md") sweep_bench_output_jsonl = false;
-                else invalid_arg = true;
-            } else {
-                invalid_arg = true;
-            }
-            if (invalid_arg) {
-                LOG("Invalid arg"); return 1;
             }
         } else {
             args.push_back(argv[i]);
         }
     }
 
+    // Setup logging and parse common params
+    common_init();
+
     common_params params;
     if (!common_params_parse(args.size(), args.data(), params, LLAMA_EXAMPLE_BENCH, print_usage)) {
         return 1;
     }
 
-    common_init();
+    // Initialize using common pattern
+    auto llama_init = common_init_from_params(params);
+    auto * model = llama_init->model();
+    auto * ctx   = llama_init->context();
 
-    //gpt_params params;
-
-    //if (!gpt_params_parse(argc, argv, params)) {
-    //    print_usage(argc, argv);
-    //    return 1;
-    //}
-
-    // init LLM
-
-    llama_backend_init();
-    llama_numa_init(params.numa);
-
-    // initialize the model
-
-    //llama_model_params model_params = llama_model_params_from_gpt_params(params);
-    llama_model_params model_params = common_model_params_to_llama(params);
-
-    //llama_model * model = llama_load_model_from_file(params.model.c_str(), model_params);
-    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), model_params);
-
-    if (model == NULL) {
-        fprintf(stderr , "%s: error: unable to load model\n" , __func__);
+    if (model == nullptr || ctx == nullptr) {
+        fprintf(stderr, "%s: failed to init\n", __func__);
         return 1;
     }
 
-    //llama_context_params ctx_params = llama_context_params_from_gpt_params(params);
-    llama_context_params ctx_params = common_context_params_to_llama(params);
-
-    //llama_context * ctx = llama_new_context_with_model(model, ctx_params);
-    llama_context * ctx = llama_init_from_model(model, ctx_params);
     auto * mem = llama_get_memory(ctx);
-
-    if (ctx == NULL) {
-        fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
-        return 1;
-    }
+    auto ctx_params = common_context_params_to_llama(params);
 
     const unsigned int n_kv_max = llama_n_ctx(ctx);
-
 
     auto vocab   = llama_model_get_vocab(model);
     auto n_vocab = llama_vocab_n_tokens(vocab);
     auto bos     = llama_vocab_bos(vocab);
-
-    //const llama_vocab * vocab = llama_get_vocab(ctx);
-    //llama_token bos = llama_token_bos_impl(*vocab);
-    //llama_token eos = llama_token_eos_impl(*vocab);
-
-    //const unsigned int n_vocab  = llama_n_vocab(model);
 
     // decode in batches of ctx_params.n_batch tokens
     auto decode_helper = [](llama_context * ctx, llama_batch & batch, int32_t n_batch) {
@@ -143,7 +104,7 @@ int main(int argc, char ** argv) {
 
     if (!sweep_bench_output_jsonl) {
         LOG_INF("\n");
-        LOG_INF("%s: n_kv_max = %d, n_batch = %d, n_ubatch = %d, flash_attn_type = %d, n_gpu_layers = %d, n_threads = %u, n_threads_batch = %u\n", __func__, n_kv_max, params.n_batch, params.n_ubatch, params.flash_attn_type, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch);
+        LOG_INF("%s: n_kv_max = %d, n_batch = %d, n_ubatch = %d, flash_attn = %d, n_gpu_layers = %d, n_threads = %u, n_threads_batch = %u\n", __func__, n_kv_max, params.n_batch, params.n_ubatch, params.flash_attn_type, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch);
         LOG_INF("\n");
         LOG_INF("|%6s | %6s | %6s | %8s | %8s | %8s | %8s |\n", "PP", "TG", "N_KV", "T_PP s", "S_PP t/s", "T_TG s", "S_TG t/s");
         LOG_INF("|%6s-|-%6s-|-%6s-|-%8s-|-%8s-|-%8s-|-%8s-|\n", "------", "------", "------", "--------", "--------", "--------", "--------");
@@ -151,10 +112,13 @@ int main(int argc, char ** argv) {
 
     llama_batch batch = llama_batch_init(n_kv_max, 0, 1);
 
+    // For recurrent and hybrid models, we need to use checkpoints because
+    // partial removal of tokens is not supported with recurrent/hybrid state
+    const bool is_recurrent = llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
+
     // warm up
     {
         common_batch_add(batch, bos, 0, { 0 }, false);
-        //llama_batch_add(batch, bos, 0, { 0 }, false);
 
         if (!decode_helper(ctx, batch, ctx_params.n_batch)) {
             LOG_INF("%s: llama_decode() failed\n", __func__);
@@ -163,35 +127,72 @@ int main(int argc, char ** argv) {
     }
 
     // Adapted into mainline from original PR: https://github.com/ikawrakow/ik_llama.cpp/pull/375
-    //if (params.batch_warmup) {
-    if (true) {
-        // clean up KV cache after generation
-        // llama_kv_self_clear(ctx);
-        llama_memory_clear(mem, true);
 
+    // clean up KV cache after generation
+    llama_memory_clear(mem, true);
 
-        // prepare batch of pp size for prompt processing performance measurement
-        common_batch_clear(batch);
+    // prepare batch of pp size for prompt processing performance measurement
+    common_batch_clear(batch);
 
-        for (unsigned int i = 0; i < (unsigned int)params.n_ubatch; ++i) {
-            common_batch_add(batch, std::rand() % n_vocab, i, { 0 }, false);
-        }
+    for (unsigned int i = 0; i < (unsigned int)params.n_ubatch; ++i) {
+        common_batch_add(batch, std::rand() % n_vocab, i, { 0 }, false);
+    }
 
-        if (!decode_helper(ctx, batch, ctx_params.n_ubatch)) {
-            LOG_INF("%s: llama_decode() failed\n", __func__);
-            return 1;
-        }
+    if (!decode_helper(ctx, batch, ctx_params.n_ubatch)) {
+        LOG_INF("%s: llama_decode() failed\n", __func__);
+        return 1;
     }
 
     common_batch_clear(batch);
-    //llama_batch_clear(batch);
-    //llama_kv_self_clear(ctx);
     llama_memory_clear(mem, true);
 
+    // For recurrent models, we use state checkpoints to avoid rebuilding context from scratch
+    std::vector<uint8_t> checkpoint_data;
+
     for (unsigned int n_kv = 0; n_kv < n_kv_max; n_kv += params.n_ubatch) {
-        // clean up KV cache before generation
-        //llama_kv_self_seq_rm(ctx, 0, n_kv, -1);
-        llama_memory_seq_rm(mem, 0, n_kv, -1);
+        // Prepare context at exactly n_kv tokens before TG
+        if (is_recurrent) {
+            if (n_kv == 0) {
+                // For n_kv=0, ensure empty context
+                llama_memory_clear(mem, true);
+            } else if (!checkpoint_data.empty()) {
+                // Restore checkpoint representing state at n_kv tokens
+                const size_t ret = llama_state_seq_set_data_ext(ctx, checkpoint_data.data(), checkpoint_data.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (ret != checkpoint_data.size()) {
+                    LOG_INF("%s: failed to restore checkpoint, falling back to rebuild\n", __func__);
+                    checkpoint_data.clear();
+                    llama_memory_clear(mem, true);
+                    for (unsigned int pos = 0; pos < n_kv; pos += params.n_batch) {
+                        const unsigned int build_tokens = std::min((unsigned int)params.n_batch, n_kv - pos);
+                        common_batch_clear(batch);
+                        for (unsigned int j = 0; j < build_tokens; ++j) {
+                            common_batch_add(batch, std::rand() % n_vocab, pos + j, { 0 }, false);
+                        }
+                        if (!decode_helper(ctx, batch, params.n_batch)) {
+                            LOG_INF("%s: llama_decode() failed to build context\n", __func__);
+                            return 1;
+                        }
+                    }
+                }
+            } else {
+                // No checkpoint yet, build from scratch (first iteration after warmup)
+                llama_memory_clear(mem, true);
+                for (unsigned int pos = 0; pos < n_kv; pos += params.n_batch) {
+                    const unsigned int build_tokens = std::min((unsigned int)params.n_batch, n_kv - pos);
+                    common_batch_clear(batch);
+                    for (unsigned int j = 0; j < build_tokens; ++j) {
+                        common_batch_add(batch, std::rand() % n_vocab, pos + j, { 0 }, false);
+                    }
+                    if (!decode_helper(ctx, batch, params.n_batch)) {
+                        LOG_INF("%s: llama_decode() failed to build context\n", __func__);
+                        return 1;
+                    }
+                }
+            }
+        } else {
+            // For transformer models, simply remove tokens beyond n_kv
+            llama_memory_seq_rm(mem, 0, n_kv, -1);
+        }
 
         // first measure token generation performance at this context size
         const auto t_tg_start = ggml_time_us();
@@ -199,8 +200,6 @@ int main(int argc, char ** argv) {
         for (unsigned int i = 0; i < tg; ++i) {
             common_batch_clear(batch);
             common_batch_add(batch, std::rand() % n_vocab, n_kv + i, { 0 }, true);
-            //llama_batch_clear(batch);
-            //llama_batch_add(batch, std::rand() % n_vocab, n_kv + i, { 0 }, true);
 
             if (!decode_helper(ctx, batch, ctx_params.n_batch)) {
                 LOG_INF("%s: llama_decode() failed\n", __func__);
@@ -210,17 +209,35 @@ int main(int argc, char ** argv) {
 
         const auto t_tg_end = ggml_time_us();
 
-        // clean up KV cache after generation
-        //llama_kv_self_seq_rm(ctx, 0, n_kv, -1);
-        llama_memory_seq_rm(mem, 0, n_kv, -1);
+        // After TG, need to return to exactly n_kv tokens before PP
+        if (is_recurrent) {
+            // Restore checkpoint to revert TG tokens
+            if (!checkpoint_data.empty()) {
+                const size_t ret = llama_state_seq_set_data_ext(ctx, checkpoint_data.data(), checkpoint_data.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (ret != checkpoint_data.size()) {
+                    LOG_INF("%s: failed to restore checkpoint after TG\n", __func__);
+                    // If restore fails, we cannot measure PP correctly
+                    return 1;
+                }
+            } else {
+                // This shouldn't happen: TG ran but no checkpoint from before?
+                // Fallback: clear everything (only valid if n_kv==0)
+                if (n_kv != 0) {
+                    LOG_INF("%s: cannot recover from missing checkpoint at n_kv=%d\n", __func__, n_kv);
+                    return 1;
+                }
+                llama_memory_clear(mem, true);
+            }
+        } else {
+            // For transformer models, remove TG tokens
+            llama_memory_seq_rm(mem, 0, n_kv, -1);
+        }
 
         // prepare batch of pp size for prompt processing performance measurement
         common_batch_clear(batch);
-        //llama_batch_clear(batch);
 
         for (unsigned int i = 0; i < pp; ++i) {
             common_batch_add(batch, std::rand() % n_vocab, n_kv + i, { 0 }, false);
-            //llama_batch_add(batch, std::rand() % n_vocab, n_kv + i, { 0 }, false);
         }
         batch.logits[batch.n_tokens - 1] = true;
 
@@ -234,6 +251,17 @@ int main(int argc, char ** argv) {
 
         const auto t_pp_end = ggml_time_us();
 
+        // Save checkpoint for next iteration (recurrent models only)
+        if (is_recurrent) {
+            const size_t checkpoint_size = llama_state_seq_get_size_ext(ctx, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            checkpoint_data.resize(checkpoint_size);
+            const size_t written = llama_state_seq_get_data_ext(ctx, checkpoint_data.data(), checkpoint_size, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (written != checkpoint_size) {
+                LOG_INF("%s: failed to save checkpoint\n", __func__);
+                checkpoint_data.clear();
+            }
+        }
+
         // calculate and print metrics
         const float t_pp = (t_pp_end - t_pp_start) / 1000000.0f;
         const float t_tg = (t_tg_end - t_tg_start) / 1000000.0f;
@@ -243,7 +271,7 @@ int main(int argc, char ** argv) {
 
         if(sweep_bench_output_jsonl) {
             LOG_INF(
-                "{\"n_kv_max\": %d, \"n_batch\": %d, \"n_ubatch\": %d, \"flash_attn_type\": %d, \"n_gpu_layers\": %d, \"n_threads\": %u, \"n_threads_batch\": %u, "
+                "{\"n_kv_max\": %d, \"n_batch\": %d, \"n_ubatch\": %d, \"flash_attn\": %d, \"n_gpu_layers\": %d, \"n_threads\": %u, \"n_threads_batch\": %u, "
                 "\"pp\": %d, \"tg\": %d, \"n_kv\": %d, \"t_pp\": %f, \"speed_pp\": %f, \"t_tg\": %f, \"speed_tg\": %f }\n",
                 n_kv_max, params.n_batch, params.n_ubatch, params.flash_attn_type, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch,
                 pp, tg, n_kv, t_pp, speed_pp, t_tg, speed_tg
@@ -254,11 +282,6 @@ int main(int argc, char ** argv) {
     }
 
     llama_batch_free(batch);
-
-    llama_free(ctx);
-    llama_model_free(model);
-
-    llama_backend_free();
 
     return 0;
 }
