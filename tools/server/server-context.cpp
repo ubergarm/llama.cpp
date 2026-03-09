@@ -12,6 +12,7 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cinttypes>
 #include <memory>
@@ -561,7 +562,7 @@ private:
 
     llama_model_ptr model_dft;
 
-    bool add_bos_token  = true;
+    bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
 
@@ -569,6 +570,7 @@ private:
     std::vector<server_slot> slots;
 
     int slots_debug = 0;
+    int n_empty_consequtive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -580,6 +582,8 @@ private:
     float slot_prompt_similarity = 0.0f;
 
     std::string model_name; // name of the loaded model, to be used by API
+    std::set<std::string> model_aliases; // additional names for the model
+    std::set<std::string> model_tags;    // informational tags
 
     bool sleeping = false;
 
@@ -813,16 +817,18 @@ private:
         SRV_WRN("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         if (!params_base.model_alias.empty()) {
-            // user explicitly specified model name
-            model_name = params_base.model_alias;
+            // backward compat: use first alias as model name
+            model_name = *params_base.model_alias.begin();
         } else if (!params_base.model.name.empty()) {
-            // use model name in registry format (for models in cache)
             model_name = params_base.model.name;
         } else {
             // fallback: derive model name from file name
             auto model_path = std::filesystem::path(params_base.model.path);
             model_name = model_path.filename().string();
         }
+
+        model_aliases = params_base.model_alias;
+        model_tags    = params_base.model_tags;
 
         if (!is_resume) {
             return init();
@@ -2344,8 +2350,10 @@ private:
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
                                         slot.prompt.checkpoints.rend(),
-                                        [&](const auto & cur) {
+                                        [&, func_name = __func__](const auto & cur) {
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
+                                            LOG_INF("slot %12.*s: id %2d | task %d | Checking checkpoint with [%d, %d] against %d...\n", 12,
+                                                func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.pos_min, cur.pos_max, pos_min_thold);
                                             return cur.pos_min < pos_min_thold;
                                         }
                                     );
@@ -2431,6 +2439,8 @@ private:
                         slot.n_prompt_tokens_cache = 0;
                     }
 
+                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+
                     // check if we should process the image
                     if (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
                         // process the image
@@ -2450,6 +2460,8 @@ private:
                             const auto & chunk = input_tokens.find_chunk(slot.prompt.n_tokens());
                             slot.prompt.tokens.push_back(chunk.get()); // copy
                         }
+
+                        do_checkpoint = false; // do not checkpoint right after an image chunk
                     }
 
                     // If using an alora, there may be uncached tokens that come
@@ -2465,8 +2477,6 @@ private:
                         slot.lora[enabled_loras[0]].scale = 0.0f;
                         alora_disabled_id = enabled_loras[0];
                     }
-
-                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
 
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
@@ -2529,47 +2539,65 @@ private:
                         slot.i_batch   = batch.n_tokens - 1;
 
                         slot.init_sampler();
-
-                        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
-                        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), slot.id);
-
-                        // no need for empty or small checkpoints
-                        do_checkpoint = do_checkpoint && (pos_min >= 0 && pos_max >= 64);
-
-                        // no need to create checkpoints that are too close together
-                        do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || pos_max > slot.prompt.checkpoints.back().pos_max + 64);
-
-                        // note: we create the checkpoint before calling llama_decode(), so the current batch is not
-                        //       yet processed and therefore it is not part of the checkpoint.
-                        if (do_checkpoint) {
-                            while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-                                // make room for the new checkpoint, if needed
-                                const auto & cur = slot.prompt.checkpoints.front();
-
-                                SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                                        cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
-
-                                slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
-                            }
-
-                            const size_t checkpoint_size = llama_state_seq_get_size_ext(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                            auto & cur = slot.prompt.checkpoints.emplace_back(server_prompt_checkpoint{
-                                /*.pos_min  = */ pos_min,
-                                /*.pos_max  = */ pos_max,
-                                /*.n_tokens = */ slot.prompt.n_tokens() - batch.n_tokens,
-                                /*.data     = */ std::vector<uint8_t>(checkpoint_size),
-                            });
-
-                            llama_state_seq_get_data_ext(ctx, cur.data.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                            SLT_WRN(slot, "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                                    (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
-                        }
-
                         SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
                     } else {
+                        // only do non-end checkpoints if the "checkpoint every n tokens" option is set
+                        do_checkpoint = do_checkpoint && params_base.checkpoint_every_nt > 0;
+                        if (do_checkpoint) {
+                            llama_pos last_checkpoint = 0;
+                            if (!slot.prompt.checkpoints.empty()) {
+                                last_checkpoint = slot.prompt.checkpoints.back().n_tokens;
+                            }
+                            do_checkpoint = do_checkpoint && slot.prompt.n_tokens() - batch.n_tokens - last_checkpoint >= params_base.checkpoint_every_nt;
+                            if (do_checkpoint) {
+                                SLT_INF(slot, "%d tokens since last checkpoint at %d, creating new checkpoint during processing at position %d\n", params_base.checkpoint_every_nt, last_checkpoint, slot.prompt.n_tokens());
+                            }
+                        }
                         SLT_INF(slot, "prompt processing progress, n_tokens = %d, batch.n_tokens = %d, progress = %f\n", slot.prompt.n_tokens(), batch.n_tokens, (float) slot.prompt.n_tokens() / slot.task->n_tokens());
+                    }
+
+                    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
+                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), slot.id);
+
+                    // no need for empty or small checkpoints
+                    do_checkpoint = do_checkpoint && (pos_min >= 0 && pos_max >= 64);
+
+                    // no need to create checkpoints that are too close together
+                    do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || pos_max > slot.prompt.checkpoints.back().pos_max + 64);
+
+                    // note: we create the checkpoint before calling llama_decode(), so the current batch is not
+                    //       yet processed and therefore it is not part of the checkpoint.
+                    if (do_checkpoint) {
+                        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+                            // make room for the new checkpoint, if needed
+                            const auto & cur = slot.prompt.checkpoints.front();
+
+                            SLT_WRN(slot,
+                                    "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64
+                                    ", size = %.3f MiB)\n",
+                                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
+
+                            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+                        }
+
+                        const size_t checkpoint_size =
+                            llama_state_seq_get_size_ext(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                        auto & cur = slot.prompt.checkpoints.emplace_back(server_prompt_checkpoint{
+                            /*.pos_min  = */ pos_min,
+                            /*.pos_max  = */ pos_max,
+                            /*.n_tokens = */ slot.prompt.n_tokens() - batch.n_tokens,
+                            /*.data     = */ std::vector<uint8_t>(checkpoint_size),
+                        });
+
+                        llama_state_seq_get_data_ext(ctx, cur.data.data(), checkpoint_size, slot.id,
+                                                     LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                        SLT_WRN(slot,
+                                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64
+                                ", size = %.3f MiB)\n",
+                                (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+                                cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
                     }
                 }
 
@@ -2601,6 +2629,12 @@ private:
 
         if (batch.n_tokens == 0) {
             SRV_WRN("%s", "no tokens to decode\n");
+
+            if (++n_empty_consequtive > 3) {
+                GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
+            }
+        } else {
+            n_empty_consequtive = 0;
         }
 
         int32_t i_next = 0;
@@ -2892,6 +2926,8 @@ server_context_meta server_context::get_meta() const {
     return server_context_meta {
         /* build_info             */ build_info,
         /* model_name             */ impl->model_name,
+        /* model_aliases          */ impl->model_aliases,
+        /* model_tags             */ impl->model_tags,
         /* model_path             */ impl->params_base.model.path,
         /* has_mtmd               */ impl->mctx != nullptr,
         /* has_inp_image          */ impl->chat_params.allow_image,
@@ -3688,6 +3724,8 @@ void server_routes::init_routes() {
             {"data", {
                 {
                     {"id",       meta->model_name},
+                    {"aliases",  meta->model_aliases},
+                    {"tags",     meta->model_tags},
                     {"object",   "model"},
                     {"created",  std::time(0)},
                     {"owned_by", "llamacpp"},
