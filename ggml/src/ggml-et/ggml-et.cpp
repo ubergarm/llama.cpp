@@ -376,8 +376,8 @@ static const struct ggml_backend_buffer_i ggml_backend_et_buffer_i = {
 };
 
 static const char * ggml_backend_et_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
-    GGML_UNUSED(buft);
-    return GGML_ET_NAME;
+    ggml_backend_et_buffer_type_context * btctx = (ggml_backend_et_buffer_type_context *)buft->context;
+    return btctx ? btctx->name.c_str() : GGML_ET_NAME;
 }
 
 static ggml_backend_buffer_t ggml_backend_et_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -1528,8 +1528,7 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
 }
 
 static bool ggml_backend_et_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    GGML_UNUSED(dev);
-    return buft->iface.get_name == ggml_backend_et_buffer_type_get_name;
+    return buft->iface.get_name == ggml_backend_et_buffer_type_get_name && buft->device == dev;
 }
 
 static bool ggml_backend_et_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
@@ -1824,6 +1823,21 @@ ggml_backend_buffer_type_t ggml_backend_et_host_buffer_type(void) {
         /* .context = */ nullptr,
     };
     return &host_buffer_type;
+}
+
+void ggml_backend_et_log_p2p_status(void) {
+    std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
+    if (!runtime) {
+        fprintf(stderr, "ET: runtime not initialized\n");
+        return;
+    }
+    std::vector<rt::DeviceId> rtids = runtime->getDevices();
+    if (rtids.size() < 2) {
+        fprintf(stderr, "ET: only %zu device(s) available, need 2 for P2P test\n", rtids.size());
+        return;
+    }
+    bool p2p = runtime->isP2PEnabled(rtids[0], rtids[1]);
+    fprintf(stderr, "ET: P2P between ET0 and ET1 is %s\n", p2p ? "ENABLED" : "DISABLED");
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_et_reg)

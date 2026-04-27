@@ -22,6 +22,7 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_et_buffer_type(size_t d
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_et_host_buffer_type(void);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_et_reg(void);
+GGML_BACKEND_API void ggml_backend_et_log_p2p_status(void);
 
 #ifdef  __cplusplus
 }
