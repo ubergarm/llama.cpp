@@ -524,12 +524,33 @@ static void ggml_backend_et_get_tensor_async(ggml_backend_t backend, const ggml_
     runtime->memcpyDeviceToHost(stream, src_ptr, dst_ptr, size, true /*barrier*/);
 }
 
-static bool ggml_backend_et_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
-    GGML_UNUSED(backend_src);
-    GGML_UNUSED(backend_dst);
-    GGML_UNUSED(src);
-    GGML_UNUSED(dst);
-    return false;
+static bool ggml_backend_et_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst,
+                                             const ggml_tensor * src, ggml_tensor * dst) {
+    // Only handle ET->ET copies; let CPU staging handle mixed backend copies
+    if (!ggml_backend_is_et(backend_src) || !ggml_backend_is_et(backend_dst)) {
+        return false;
+    }
+
+    ggml_backend_et_device_context * src_ctx = (ggml_backend_et_device_context *)backend_src->device->context;
+    ggml_backend_et_device_context * dst_ctx = (ggml_backend_et_device_context *)backend_dst->device->context;
+
+    std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
+    if (!runtime || !runtime->isP2PEnabled(src_ctx->rtid, dst_ctx->rtid)) {
+        return false;
+    }
+
+    // ET graph_compute launches kernels asynchronously; the source stream may still be
+    // writing src->data when we get here. Sync the src stream first since ET has no
+    // cross-stream wait primitive (e.g. cudaStreamWaitEvent).
+    runtime->waitForStream(src_ctx->default_stream);
+
+    // Use the streamDst variant so the copy is ordered before subsequent graph work
+    // on the destination stream.
+    runtime->memcpyDeviceToDevice(src_ctx->rtid, dst_ctx->default_stream,
+                                  static_cast<const std::byte*>(src->data),
+                                  static_cast<std::byte*>(dst->data),
+                                  ggml_nbytes(src), true);
+    return true;
 }
 
 static void ggml_backend_et_synchronize(ggml_backend_t backend) {
@@ -1554,7 +1575,7 @@ static const struct ggml_backend_i ggml_backend_et_i = {
     /* .get_tensor_async        = */ ggml_backend_et_get_tensor_async,
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
-    /* .cpy_tensor_async        = */ NULL,
+    /* .cpy_tensor_async        = */ ggml_backend_et_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_et_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
