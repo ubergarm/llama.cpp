@@ -332,10 +332,42 @@ static void ggml_backend_et_buffer_get_tensor(ggml_backend_buffer_t buffer, cons
 }
 
 static bool ggml_backend_et_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
-    GGML_UNUSED(buffer);
-    GGML_UNUSED(src);
-    GGML_UNUSED(dst);
-    return false;
+    // Only handle ET->ET copies; let CPU staging handle mixed backend copies
+    if (src->buffer->iface.free_buffer != ggml_backend_et_buffer_free_buffer) {
+        return false;
+    }
+
+    ggml_backend_et_buffer_context * src_ctx = (ggml_backend_et_buffer_context *)src->buffer->context;
+    ggml_backend_et_buffer_context * dst_ctx = (ggml_backend_et_buffer_context *)dst->buffer->context;
+
+    std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
+    if (!runtime) {
+        return false;
+    }
+
+    if (src_ctx->rtid != dst_ctx->rtid && !runtime->isP2PEnabled(src_ctx->rtid, dst_ctx->rtid)) {
+        return false;
+    }
+
+    ggml_backend_et_device_context * dst_dev_ctx = (ggml_backend_et_device_context *)buffer->buft->device->context;
+
+    rt::EventId event = runtime->memcpyDeviceToDevice(src_ctx->rtid, dst_dev_ctx->default_stream,
+                                                      static_cast<const std::byte*>(src->data),
+                                                      static_cast<std::byte*>(dst->data),
+                                                      ggml_nbytes(src), true);
+
+    runtime->waitForEvent(event);
+
+    auto errors = runtime->retrieveStreamErrors(dst_dev_ctx->default_stream);
+    if (!errors.empty()) {
+        for (const auto& err : errors) {
+            GGML_LOG_ERROR("ET: buffer_cpy_tensor stream error. Code: %d, Type: %d\n",
+                           (int)err.errorCode_, (int)err.errorContext_.value()[0].type_);
+        }
+        return false;
+    }
+
+    return true;
 }
 
 static void ggml_backend_et_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -546,10 +578,22 @@ static bool ggml_backend_et_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 
     // Use the streamDst variant so the copy is ordered before subsequent graph work
     // on the destination stream.
-    runtime->memcpyDeviceToDevice(src_ctx->rtid, dst_ctx->default_stream,
+    rt::EventId event = runtime->memcpyDeviceToDevice(src_ctx->rtid, dst_ctx->default_stream,
                                   static_cast<const std::byte*>(src->data),
                                   static_cast<std::byte*>(dst->data),
                                   ggml_nbytes(src), true);
+
+    runtime->waitForEvent(event);
+
+    auto errors = runtime->retrieveStreamErrors(dst_ctx->default_stream);
+    if (!errors.empty()) {
+        for (const auto& err : errors) {
+            GGML_LOG_ERROR("ET: cpy_tensor_async stream error. Code: %d, Type: %d\n",
+                           (int)err.errorCode_, (int)err.errorContext_.value()[0].type_);
+        }
+        return false;
+    }
+
     return true;
 }
 
